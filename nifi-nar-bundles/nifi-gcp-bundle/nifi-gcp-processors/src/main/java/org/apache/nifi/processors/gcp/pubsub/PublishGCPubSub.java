@@ -314,6 +314,7 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
 
         return Publisher.newBuilder(getTopicName(context))
                 .setCredentialsProvider(FixedCredentialsProvider.create(getGoogleCredentials(context)))
+                .setExecutorProvider(FixedExecutorProvider.create(new ScheduledThreadPoolExecutor(1)))
                 .setChannelProvider(getTransportChannelProvider(context))
                 .setBatchingSettings(BatchingSettings.newBuilder()
                 .setElementCountThreshold(batchSize)
