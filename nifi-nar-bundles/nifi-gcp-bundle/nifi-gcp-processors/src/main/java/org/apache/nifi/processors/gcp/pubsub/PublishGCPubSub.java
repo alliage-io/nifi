@@ -19,6 +19,7 @@ package org.apache.nifi.processors.gcp.pubsub;
 import com.google.api.core.ApiFuture;
 import com.google.api.gax.batching.BatchingSettings;
 import com.google.api.gax.core.FixedCredentialsProvider;
+import com.google.api.gax.core.FixedExecutorProvider;
 import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.DeadlineExceededException;
 import com.google.cloud.pubsub.v1.Publisher;
@@ -42,12 +43,12 @@ import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
-import org.apache.nifi.components.ConfigVerificationResult;
+import org.apache.nifi.components.*;
 import org.apache.nifi.components.ConfigVerificationResult.Outcome;
-import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
@@ -65,13 +66,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_ATTRIBUTE;
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_DESCRIPTION;
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.TOPIC_NAME_ATTRIBUTE;
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.TOPIC_NAME_DESCRIPTION;
+import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.EXECUTOR_THREADS_NUMBER_ATTRIBUTE;
+import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.EXECUTOR_THREADS_NUMBER_DESCRIPTION;
 
 @SeeAlso({ConsumeGCPubSub.class})
 @InputRequirement(Requirement.INPUT_REQUIRED)
@@ -82,11 +87,53 @@ import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.TOPIC_NAME_
         description = "Attributes to be set for the outgoing Google Cloud PubSub message", expressionLanguageScope = ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
 @WritesAttributes({
         @WritesAttribute(attribute = MESSAGE_ID_ATTRIBUTE, description = MESSAGE_ID_DESCRIPTION),
-        @WritesAttribute(attribute = TOPIC_NAME_ATTRIBUTE, description = TOPIC_NAME_DESCRIPTION)
+        @WritesAttribute(attribute = TOPIC_NAME_ATTRIBUTE, description = TOPIC_NAME_DESCRIPTION),
 })
 @SystemResourceConsideration(resource = SystemResource.MEMORY, description = "The entirety of the FlowFile's content "
         + "will be read into memory to be sent as a PubSub message.")
 public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
+    private static final Validator THREAD_COUNT_VALIDATOR = new Validator() {
+        private final Pattern DATA_SIZE_PATTERN = Pattern.compile(DataUnit.DATA_SIZE_REGEX);
+
+        @Override
+        public ValidationResult validate(final String subject, final String input, final ValidationContext context) {
+            if (input == null) {
+                return new ValidationResult.Builder()
+                        .subject(subject)
+                        .input(input)
+                        .valid(false)
+                        .explanation("Thread count cannot be null")
+                        .build();
+            }
+            String inputToValidate = null;
+            if (input.endsWith("C")) {
+                inputToValidate = input.substring(0, input.length() - 1);
+            }
+            else {
+                inputToValidate = input;
+            }
+
+            try {
+                final int intVal = Integer.parseInt(inputToValidate);
+                if (intVal < 0) {
+                    return new ValidationResult.Builder()
+                            .subject(subject)
+                            .input(input)
+                            .valid(false)
+                            .explanation("Thread count cannot be negative")
+                            .build();
+                }
+            } catch (final NumberFormatException e) {
+                return new ValidationResult.Builder()
+                        .subject(subject)
+                        .input(input)
+                        .valid(false)
+                        .explanation("Thread count value is invalid")
+                        .build();
+            }
+            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
+        }
+    };
     private static final List<String> REQUIRED_PERMISSIONS = Collections.singletonList("pubsub.topics.publish");
 
     public static final PropertyDescriptor TOPIC_NAME = new PropertyDescriptor.Builder()
@@ -96,6 +143,14 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
             .required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .build();
+
+    public static final PropertyDescriptor EXECUTOR_THREADS_NUMBER = new PropertyDescriptor.Builder()
+            .name("gcp-pubsub-threadcount")
+            .displayName("Thread count")
+            .description("Number of threads to be used by the Publisher executor")
+            .required(false)
+            .addValidator(THREAD_COUNT_VALIDATOR)
             .build();
 
     public static final Relationship REL_RETRY = new Relationship.Builder()
@@ -111,6 +166,7 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
         final List<PropertyDescriptor> descriptors = new ArrayList<>(super.getSupportedPropertyDescriptors());
         descriptors.add(TOPIC_NAME);
         descriptors.add(BATCH_SIZE);
+        descriptors.add(EXECUTOR_THREADS_NUMBER);
         return Collections.unmodifiableList(descriptors);
     }
 
