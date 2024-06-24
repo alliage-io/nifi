@@ -48,7 +48,6 @@ import org.apache.nifi.components.ConfigVerificationResult.Outcome;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
-import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
@@ -64,12 +63,12 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Pattern;
 
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_ATTRIBUTE;
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_DESCRIPTION;
@@ -92,48 +91,7 @@ import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.EXECUTOR_TH
 @SystemResourceConsideration(resource = SystemResource.MEMORY, description = "The entirety of the FlowFile's content "
         + "will be read into memory to be sent as a PubSub message.")
 public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
-    private static final Validator THREAD_COUNT_VALIDATOR = new Validator() {
-        private final Pattern DATA_SIZE_PATTERN = Pattern.compile(DataUnit.DATA_SIZE_REGEX);
 
-        @Override
-        public ValidationResult validate(final String subject, final String input, final ValidationContext context) {
-            if (input == null) {
-                return new ValidationResult.Builder()
-                        .subject(subject)
-                        .input(input)
-                        .valid(false)
-                        .explanation("Thread count cannot be null")
-                        .build();
-            }
-            String inputToValidate = null;
-            if (input.endsWith("C")) {
-                inputToValidate = input.substring(0, input.length() - 1);
-            }
-            else {
-                inputToValidate = input;
-            }
-
-            try {
-                final int intVal = Integer.parseInt(inputToValidate);
-                if (intVal < 0) {
-                    return new ValidationResult.Builder()
-                            .subject(subject)
-                            .input(input)
-                            .valid(false)
-                            .explanation("Thread count cannot be negative")
-                            .build();
-                }
-            } catch (final NumberFormatException e) {
-                return new ValidationResult.Builder()
-                        .subject(subject)
-                        .input(input)
-                        .valid(false)
-                        .explanation("Thread count value is invalid")
-                        .build();
-            }
-            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
-        }
-    };
     private static final List<String> REQUIRED_PERMISSIONS = Collections.singletonList("pubsub.topics.publish");
 
     public static final PropertyDescriptor TOPIC_NAME = new PropertyDescriptor.Builder()
@@ -148,9 +106,9 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
     public static final PropertyDescriptor EXECUTOR_THREADS_NUMBER = new PropertyDescriptor.Builder()
             .name("gcp-pubsub-threadcount")
             .displayName("Thread count")
-            .description("Number of threads to be used by the Publisher executor")
+            .description("Number of threads to be used by the PubSub driver. Either empty (interpreted as 'auto'), 'auto', or a fixed positive integer value")
             .required(false)
-            .addValidator(THREAD_COUNT_VALIDATOR)
+            .addValidator(new ThreadCountValidator())
             .build();
 
     public static final Relationship REL_RETRY = new Relationship.Builder()
@@ -194,6 +152,7 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
     public void onScheduled(ProcessContext context) {
         try {
             publisher = getPublisherBuilder(context).build();
+
         } catch (IOException e) {
             getLogger().error("Failed to create Google Cloud PubSub Publisher due to {}", new Object[]{e});
             storedException.set(e);
@@ -367,8 +326,9 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
 
     private Publisher.Builder getPublisherBuilder(ProcessContext context) {
         final Long batchSize = context.getProperty(BATCH_SIZE).asLong();
+        final Optional<Integer> threadCount = ThreadCountValidator.parse(context.getProperty(EXECUTOR_THREADS_NUMBER).getValue());
 
-        return Publisher.newBuilder(getTopicName(context))
+        Publisher.Builder builder = Publisher.newBuilder(getTopicName(context))
                 .setCredentialsProvider(FixedCredentialsProvider.create(getGoogleCredentials(context)))
                 .setExecutorProvider(FixedExecutorProvider.create(new ScheduledThreadPoolExecutor(1)))
                 .setChannelProvider(getTransportChannelProvider(context))
@@ -376,5 +336,10 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
                 .setElementCountThreshold(batchSize)
                 .setIsEnabled(true)
                 .build());
+        //Set fixed threadpool executor if threadCount is defineds
+        if(threadCount.isPresent()){
+            builder.setExecutorProvider(FixedExecutorProvider.create(new ScheduledThreadPoolExecutor(threadCount.get())));
+        }
+        return builder;
     }
 }
