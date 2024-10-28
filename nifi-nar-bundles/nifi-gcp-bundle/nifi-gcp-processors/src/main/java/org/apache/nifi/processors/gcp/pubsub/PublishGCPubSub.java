@@ -20,6 +20,7 @@ import com.google.api.core.ApiFuture;
 import com.google.api.gax.batching.BatchingSettings;
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.core.FixedExecutorProvider;
 import com.google.api.gax.rpc.DeadlineExceededException;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.cloud.pubsub.v1.stub.GrpcPublisherStub;
@@ -67,6 +68,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_ATTRIBUTE;
 import static org.apache.nifi.processors.gcp.pubsub.PubSubAttributes.MESSAGE_ID_DESCRIPTION;
@@ -312,12 +314,18 @@ public class PublishGCPubSub extends AbstractGCPubSubWithProxyProcessor {
     private Publisher.Builder getPublisherBuilder(ProcessContext context) {
         final Long batchSize = context.getProperty(BATCH_SIZE).asLong();
 
-        return Publisher.newBuilder(getTopicName(context))
+        final Publisher.Builder publisherBuilder = Publisher.newBuilder(getTopicName(context))
                 .setCredentialsProvider(FixedCredentialsProvider.create(getGoogleCredentials(context)))
                 .setChannelProvider(getTransportChannelProvider(context))
                 .setBatchingSettings(BatchingSettings.newBuilder()
                 .setElementCountThreshold(batchSize)
                 .setIsEnabled(true)
                 .build());
+
+        // Set fixed thread pool executor to number of concurrent tasks
+        publisherBuilder.setExecutorProvider(FixedExecutorProvider.create(new ScheduledThreadPoolExecutor(context.getMaxConcurrentTasks())));
+
+        return publisherBuilder;
+
     }
 }
